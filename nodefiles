@@ -1,0 +1,444 @@
+#!/bin/bash
+# Copyright (2018): Jonas Rylund Glesaaen (jonas@glesaaen.com)
+# License: MIT
+#
+# Utility script that generates machinefiles used by MPI if one needs to do a
+# multi-MPI run on clusters with scattering schedulers.
+#
+# Usage: nodefiles [--help] [--check] [--fills] [--dry] [--no_overwrite]"
+#                  [--pattern PATTERN] [--total_nodes NODES]"
+#                  <--cores_per_run CORES> <--cores_per_node CORES>"
+#                  <--runs RUNS> <--file NODEFILE>"
+#
+# For a more detailed description of the options please call
+# nodefiles --help
+
+# Program variables
+# {{{
+
+# Variables from cmd-line
+Nodefiles_nodefile=""
+Nodefiles_cores_per_node=""
+Nodefiles_cores_per_run=""
+Nodefiles_num_nodes=""
+Nodefiles_num_runs=""
+Nodefiles_pattern=""
+
+# Flags from cmd-line
+Nodefiles_help_flag=""
+Nodefiles_check_flag=""
+Nodefiles_fill_flag=""
+Nodefiles_dry_run=""
+Nodefiles_overwrite=""
+
+# }}}
+
+# Program functions
+# {{{
+
+## Information functions
+## {{{
+
+# Print the usage string
+print-usage-message ()
+{
+  echo "Usage: nodefiles [--help] [--check] [--fills] [--dry] [--no_overwrite]"
+  echo "                 [--pattern PATTERN] [--total_nodes NODES]"
+  echo "                 <--cores_per_run CORES> <--cores_per_node CORES>"
+  echo "                 <--runs RUNS> <--file NODEFILE>"
+}
+
+# Print the full help message
+print-help-message ()
+{
+  print-usage-message
+
+  echo ""
+  echo "Program parameters:"
+  echo "--cores_per_run,-c CORES  Set the number of cores each run will use"
+  echo "--cores_per_node,C CORES  Specify the number of cores available on each node"
+  echo "--runs,-n RUNS            Set the total number of mpiruns to make machinefiles for"
+  echo "--file,-f NODEFILE        Path to file containing allocated nodes"
+  echo ""
+  echo "Optional parameters:"
+  echo "--total_nodes,-N NODES  Override the node count from the nodefile"
+  echo "--pattern PATTERN       Specify the pattern to use for the individual machinefiles"
+  echo "                        These will be parsed by printf given the run-id as a paramter"
+  echo "                        Default: machinefile_%d"
+  echo "--help                  Print this help message"
+  echo "--check                 Exit if the total core count exceeds the allocated one"
+  echo "--fills                 Exit if the total core count is not exactly the allocated one"
+  echo "--dry                   Print some information about the request and exit"
+  echo "--no_overwrite          Check that no files will be overwritten, exit if they will"
+}
+
+## }}}
+
+## Core count arithmatic
+## {{{
+
+# Looks up the total number of available nodes
+available-nodes ()
+{
+  if test "x${Nodefiles_num_nodes}" == "x"; then
+    RESULT=$(cat ${Nodefiles_nodefile} | wc -l)
+  else
+    RESULT=${Nodefiles_num_nodes}
+  fi
+}
+
+# Gives the number of "batches" or runs that will share a partially filled node
+batch-count ()
+{
+  local leftover_cores=$((Nodefiles_cores_per_run % Nodefiles_cores_per_node))
+
+  if [ ! ${leftover_cores} -eq 0 ]; then
+
+    # Compile the python code in a bash-like manner
+    local expr="${Nodefiles_cores_per_node}.0 / (${Nodefiles_cores_per_run} % ${Nodefiles_cores_per_node})"
+    local py="from math import ceil; print int(ceil(${expr}))"
+
+    RESULT=$(python -c "${py}")
+  else
+    RESULT=1
+  fi
+}
+
+## }}}
+
+## Checks
+## {{{
+
+# Checks that the allocation fits on the requested number of nodes
+check-fits ()
+{
+  available-nodes
+  local total_nodes="${RESULT}"
+  local allocated_cores=$((total_nodes * Nodefiles_cores_per_node))
+
+  if [ $((Nodefiles_cores_per_run * Nodefiles_num_runs)) -gt ${allocated_cores} ]
+  then
+    RESULT=0
+  else
+    RESULT=1
+  fi
+}
+
+# Check that one fills up the entire allocation
+check-fills ()
+{
+  available-nodes
+  local total_nodes="${RESULT}"
+  local allocated_cores=$((total_nodes * Nodefiles_cores_per_node))
+
+  if [ ! $((Nodefiles_cores_per_run * Nodefiles_num_runs)) -eq ${allocated_cores} ]
+  then
+    RESULT=0
+  else
+    RESULT=1
+  fi
+}
+
+check-overwrite ()
+{
+  for idx in $(seq 1 ${Nodefiles_num_runs})
+  do
+    filename=$(printf ${Nodefiles_pattern} ${idx})
+    
+    if [ -f ${filename} ]; then
+      RESULT=1
+      return 0
+    fi
+  done
+
+  RESULT=0
+}
+
+## }}}
+
+## Nodefile builds
+## {{{
+
+add-full-nodes ()
+{
+  local start="${1}"
+  local filename="${2}"
+
+  local full_nodes=$((Nodefiles_cores_per_run / Nodefiles_cores_per_node))
+
+  RESULT=${start}
+
+  if [ ! ${full_nodes} -gt 0 ]; then
+    return 0
+  fi
+
+  sed -n "${start},$((start + full_nodes - 1))p" ${Nodefiles_nodefile} | \
+    sed -e "s,$,:${Nodefiles_cores_per_node}," >> \
+    ${filename}
+
+  RESULT=$((start + full_nodes))
+}
+
+add-partial-nodes ()
+{
+  local idx="${1}"
+  local start="${2}"
+  local filename="${3}"
+
+  local full_nodes=$((Nodefiles_cores_per_run / Nodefiles_cores_per_node))
+  local leftover_cores=$((Nodefiles_cores_per_run % Nodefiles_cores_per_node))
+
+  batch-count
+  local runs_per_batch="${RESULT}"
+
+  RESULT=${start}
+
+  # Append the shared nodes if any
+  if [ ${runs_per_batch} -gt 1 ]
+  then
+    local lidx=$((idx % runs_per_batch))
+    local shared_offset=$(((runs_per_batch - lidx) % runs_per_batch))
+
+    sed -n "$((start + full_nodes * shared_offset))p" ${Nodefiles_nodefile} | \
+      sed -e "s,$,:${leftover_cores}," >> \
+      ${filename}
+
+    # Increment the current line if last run in batch
+    if [ $((idx % runs_per_batch)) -eq 0 ]
+    then
+      RESULT=$((start + 1))
+    fi
+  fi
+
+}
+
+build-nodefiles ()
+{
+  local nodefile_line=1
+
+  for idx in $(seq 1 ${Nodefiles_num_runs})
+  do
+    filename=$(printf ${Nodefiles_pattern} ${idx})
+    rm -f ${filename}
+
+    add-full-nodes ${nodefile_line} ${filename}
+    nodefile_line="${RESULT}"
+
+    add-partial-nodes ${idx} ${nodefile_line} ${filename}
+    nodefile_line="${RESULT}"
+  done
+}
+
+## }}}
+
+## Information
+## {{{
+
+print-run-information ()
+{
+  local total_cores=$((Nodefiles_cores_per_run * Nodefiles_num_runs))
+
+  available-nodes
+  local total_nodes="${RESULT}"
+  local allocated_cores=$((total_nodes * Nodefiles_cores_per_node))
+
+  local full_nodes=$((Nodefiles_cores_per_run / Nodefiles_cores_per_node))
+  local leftover_cores=$((Nodefiles_cores_per_run % Nodefiles_cores_per_node))
+
+  batch-count
+  local runs_per_batch="${RESULT}"
+  local leftover_nodes=$((Nodefiles_num_runs / runs_per_batch))
+
+  echo "Used cores: ${total_cores} / ${allocated_cores}"
+  echo "Number of full nodes: ${full_nodes}"
+  echo "Leftover cores per run: ${leftover_cores} / ${Nodefiles_cores_per_run}"
+  echo "Leftover nodes: ${leftover_nodes}"
+  echo "Runs per leftover node: ${runs_per_batch}"
+}
+
+## }}}
+
+# }}}
+
+# Main run
+# {{{
+
+## Parse program options
+## {{{
+
+getopt_results=$(\
+  getopt \
+    -s bash \
+    -o f:c:C:n:N:h \
+    --long file:,cores_per_run:,cores_per_node:,runs:total_nodes:,pattern:,help,check,fills,dry,no_overwrite \
+    -- "$@")
+
+if test $? != 0
+then
+  print-usage-message
+  exit 1
+fi
+
+eval set -- "${getopt_results}"
+
+while true
+do
+  case "$1" in
+    --help|-h)
+      Nodefiles_help_flag=1;
+      shift 1;
+      ;;
+    --file|-f)
+      Nodefiles_nodefile="$2";
+      shift 2;
+      ;;
+    --cores_per_run|-c)
+      Nodefiles_cores_per_run="$2";
+      shift 2;
+      ;;
+    --cores_per_node|-C)
+      Nodefiles_cores_per_node="$2";
+      shift 2;
+      ;;
+    --runs|-n)
+      Nodefiles_num_runs="$2"
+      shift 2;
+      ;;
+    --total_nodes|-N)
+      Nodefiles_num_nodes="$2"
+      shift 2;
+      ;;
+    --pattern)
+      Nodefiles_pattern="$2"
+      shift 2;
+      ;;
+    --check)
+      Nodefiles_check_flag="1"
+      shift 1;
+      ;;
+    --fills)
+      Nodefiles_check_flag="1"
+      Nodefiles_fill_flag="1"
+      shift 1;
+      ;;
+    --dry)
+      Nodefiles_dry_run="1"
+      shift 1;
+      ;;
+    --no_overwrite)
+      Nodefiles_overwrite="1"
+      shift 1;
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      echo "$0: Unparseable option $1"
+      exit 1
+      ;;
+  esac
+done
+
+## }}}
+
+if test "${Nodefiles_help_flag}" == "1"; then
+  print-help-message
+  exit 0
+fi
+
+## Pre possible dry run parameter checks
+## {{{
+
+if test "x${Nodefiles_cores_per_node}" == "x"
+then
+  echo "--cores_per_node not set"
+  print-usage-message
+  exit 1
+fi
+
+if test "x${Nodefiles_cores_per_run}" == "x"
+then
+  echo "--cores_per_run not set"
+  print-usage-message
+  exit 1
+fi
+
+if test "x${Nodefiles_num_runs}" == "x"
+then
+  echo "--runs not set"
+  print-usage-message
+  exit 1
+fi
+
+## }}}
+
+## Setting defaults
+## {{{
+
+if test "x${Nodefiles_pattern}" == "x"
+then
+  Nodefiles_pattern="machinefile_%d"
+fi
+
+## }}}
+ 
+## Preliminary checks and dry runs
+## {{{
+
+if test "${Nodefiles_check_flag}" == "1"; then
+  check-fits
+
+  if test "${RESULT}" == "0"; then
+    echo "The job does not fit within the requested core count"
+    exit 1
+  fi
+fi
+
+if test "${Nodefiles_fill_flag}" == "1"; then
+  check-fills
+
+  if test "${RESULT}" == "0"; then
+    echo "The job does not fill the requested core count"
+    exit 1
+  fi
+fi
+
+if test "${Nodefiles_overwrite}" == "1"; then
+  check-overwrite
+
+  if test "${RESULT}" == "1"; then
+    echo "The program overwrites files"
+    exit 1
+  fi
+fi
+
+if test "${Nodefiles_dry_run}" == "1"; then
+  print-run-information
+  exit 0
+fi
+
+## }}}
+
+## Pre possible dry run parameter checks
+## {{{
+
+if test "x${Nodefiles_nodefile}" == "x"
+then
+  echo "--file not set"
+  print-usage-message
+  exit 1
+fi
+
+if [ ! -f ${Nodefiles_nodefile} ];
+then
+  echo "The nodefile \"${Nodefiles_nodefile}\" is not a regular file"
+  exit 1
+fi
+
+## }}}
+
+# Finally run the main routine
+build-nodefiles
+
+# }}}
