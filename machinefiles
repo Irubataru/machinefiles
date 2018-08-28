@@ -295,7 +295,7 @@ parse-program-options ()
     getopt \
       -s bash \
       -o f:c:C:n:N:h \
-      --long file:,cores_per_run:,cores_per_node:,runs:total_nodes:,pattern:,help,check,fills,dry,no_overwrite \
+      --long file:,cores_per_run:,cores_per_node:,runs:,total_nodes:,pattern:,help,check,fills,dry,no_overwrite \
       -- "$@")
 
   if test $? != 0
