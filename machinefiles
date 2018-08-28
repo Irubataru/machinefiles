@@ -87,21 +87,35 @@ available-nodes ()
   fi
 }
 
-# Gives the number of "batches" or runs that will share a partially filled node
-batch-count ()
+# Reduce the fraction "leftover / cores_per_node" so that we can find out how
+# many batches we need and how many nodes per batch
+leftover-fraction ()
 {
   local leftover_cores=$((Machinefiles_cores_per_run % Machinefiles_cores_per_node))
 
-  if [ ! ${leftover_cores} -eq 0 ]; then
+  local fraction_expr="Fraction(${leftover_cores}, ${Machinefiles_cores_per_node})"
+  local py="from fractions import Fraction; print ${fraction_expr}"
 
-    # Compile the python code in a bash-like manner
-    local expr="${Machinefiles_cores_per_node}.0 / (${Machinefiles_cores_per_run} % ${Machinefiles_cores_per_node})"
-    local py="from math import ceil; print int(ceil(${expr}))"
+  RESULT=$(python -c "${py}")
 
-    RESULT=$(python -c "${py}")
-  else
-    RESULT=1
+  if [[ ! ${RESULT} = *"/"* ]]; then
+    RESULT="${RESULT}/1"
   fi
+}
+
+# Gives the number of leftover "batches" or runs that will share a partially
+# filled node
+leftover-batch-count ()
+{
+  leftover-fraction
+  RESULT=$(echo "${RESULT}" | cut -d '/' -f 2)
+}
+
+# Gives the number of leftover nodes used for the shared batches
+leftover-node-count ()
+{
+  leftover-fraction
+  RESULT=$(echo "${RESULT}" | cut -d '/' -f 1)
 }
 
 ## }}}
@@ -185,31 +199,35 @@ add-partial-nodes ()
   local start="${2}"
   local filename="${3}"
 
-  local full_nodes=$((Machinefiles_cores_per_run / Machinefiles_cores_per_node))
-  local leftover_cores=$((Machinefiles_cores_per_run % Machinefiles_cores_per_node))
-
-  batch-count
+  leftover-batch-count
   local runs_per_batch="${RESULT}"
+
+  leftover-node-count
+  local nodes_per_batch="${RESULT}"
 
   RESULT=${start}
 
   # Append the shared nodes if any
-  if [ ${runs_per_batch} -gt 1 ]
+  if [ ${nodes_per_batch} -gt 0 ]
   then
+
+    local full_nodes=$((Machinefiles_cores_per_run / Machinefiles_cores_per_node))
+    local leftover_cores=$((Machinefiles_cores_per_run % Machinefiles_cores_per_node))
+
     local lidx=$((idx % runs_per_batch))
     local shared_offset=$(((runs_per_batch - lidx) % runs_per_batch))
+    local lstart=$((start + full_nodes * shared_offset))
 
-    sed -n "$((start + full_nodes * shared_offset))p" ${Machinefiles_machinefiles} | \
-      sed -e "s,$,:${leftover_cores}," >> \
+    sed -n "${lstart},$((lstart + nodes_per_batch - 1))p" ${Machinefiles_machinefiles} | \
+      sed -e "s,$,:$((leftover_cores / nodes_per_batch))," >> \
       ${filename}
 
     # Increment the current line if last run in batch
     if [ $((idx % runs_per_batch)) -eq 0 ]
     then
-      RESULT=$((start + 1))
+      RESULT=$((start + nodes_per_batch))
     fi
   fi
-
 }
 
 build-machinefiles ()
@@ -243,17 +261,22 @@ print-run-information ()
   local allocated_cores=$((total_nodes * Machinefiles_cores_per_node))
 
   local full_nodes=$((Machinefiles_cores_per_run / Machinefiles_cores_per_node))
-  local leftover_cores=$((Machinefiles_cores_per_run % Machinefiles_cores_per_node))
 
-  batch-count
+  leftover-batch-count
   local runs_per_batch="${RESULT}"
+
+  leftover-node-count
+  local nodes_per_batch="${RESULT}"
+
+  local leftover_cores=$((Machinefiles_cores_per_run % Machinefiles_cores_per_node))
   local leftover_nodes=$((Machinefiles_num_runs / runs_per_batch))
 
   echo "Used cores: ${total_cores} / ${allocated_cores}"
   echo "Number of full nodes: ${full_nodes}"
   echo "Leftover cores per run: ${leftover_cores} / ${Machinefiles_cores_per_run}"
-  echo "Leftover nodes: ${leftover_nodes}"
+  echo "Leftover nodes: ${leftover_nodes} / ${total_nodes}"
   echo "Runs per leftover node: ${runs_per_batch}"
+  echo "Nodes per leftover node: ${nodes_per_batch}"
 }
 
 ## }}}
@@ -266,81 +289,86 @@ print-run-information ()
 ## Parse program options
 ## {{{
 
-getopt_results=$(\
-  getopt \
-    -s bash \
-    -o f:c:C:n:N:h \
-    --long file:,cores_per_run:,cores_per_node:,runs:total_nodes:,pattern:,help,check,fills,dry,no_overwrite \
-    -- "$@")
+parse-program-options ()
+{
+  getopt_results=$(\
+    getopt \
+      -s bash \
+      -o f:c:C:n:N:h \
+      --long file:,cores_per_run:,cores_per_node:,runs:total_nodes:,pattern:,help,check,fills,dry,no_overwrite \
+      -- "$@")
 
-if test $? != 0
-then
-  print-usage-message
-  exit 1
-fi
+  if test $? != 0
+  then
+    print-usage-message
+    exit 1
+  fi
 
-eval set -- "${getopt_results}"
+  eval set -- "${getopt_results}"
 
-while true
-do
-  case "$1" in
-    --help|-h)
-      Machinefiles_help_flag=1;
-      shift 1;
-      ;;
-    --file|-f)
-      Machinefiles_machinefiles="$2";
-      shift 2;
-      ;;
-    --cores_per_run|-c)
-      Machinefiles_cores_per_run="$2";
-      shift 2;
-      ;;
-    --cores_per_node|-C)
-      Machinefiles_cores_per_node="$2";
-      shift 2;
-      ;;
-    --runs|-n)
-      Machinefiles_num_runs="$2"
-      shift 2;
-      ;;
-    --total_nodes|-N)
-      Machinefiles_num_nodes="$2"
-      shift 2;
-      ;;
-    --pattern)
-      Machinefiles_pattern="$2"
-      shift 2;
-      ;;
-    --check)
-      Machinefiles_check_flag="1"
-      shift 1;
-      ;;
-    --fills)
-      Machinefiles_check_flag="1"
-      Machinefiles_fill_flag="1"
-      shift 1;
-      ;;
-    --dry)
-      Machinefiles_dry_run="1"
-      shift 1;
-      ;;
-    --no_overwrite)
-      Machinefiles_overwrite="1"
-      shift 1;
-      ;;
-    --)
-      shift
-      break
-      ;;
-    *)
-      echo "$0: Unparseable option $1"
-      exit 1
-      ;;
-  esac
-done
+  while true
+  do
+    case "$1" in
+      --help|-h)
+        Machinefiles_help_flag=1;
+        shift 1;
+        ;;
+      --file|-f)
+        Machinefiles_machinefiles="$2";
+        shift 2;
+        ;;
+      --cores_per_run|-c)
+        Machinefiles_cores_per_run="$2";
+        shift 2;
+        ;;
+      --cores_per_node|-C)
+        Machinefiles_cores_per_node="$2";
+        shift 2;
+        ;;
+      --runs|-n)
+        Machinefiles_num_runs="$2"
+        shift 2;
+        ;;
+      --total_nodes|-N)
+        Machinefiles_num_nodes="$2"
+        shift 2;
+        ;;
+      --pattern)
+        Machinefiles_pattern="$2"
+        shift 2;
+        ;;
+      --check)
+        Machinefiles_check_flag="1"
+        shift 1;
+        ;;
+      --fills)
+        Machinefiles_check_flag="1"
+        Machinefiles_fill_flag="1"
+        shift 1;
+        ;;
+      --dry)
+        Machinefiles_dry_run="1"
+        shift 1;
+        ;;
+      --no_overwrite)
+        Machinefiles_overwrite="1"
+        shift 1;
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        echo "$0: Unparseable option $1"
+        exit 1
+        ;;
+    esac
+  done
+}
 
 ## }}}
+
+parse-program-options "$@"
 
 if test "${Machinefiles_help_flag}" == "1"; then
   print-help-message
@@ -438,7 +466,6 @@ fi
 
 ## }}}
 
-# Finally run the main routine
 build-machinefiles
 
 # }}}
